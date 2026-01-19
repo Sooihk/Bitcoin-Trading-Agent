@@ -172,115 +172,312 @@ class CandleStore:
             except Exception as e:
                 print(f"[WARN] S3 upload failed ({type(e).__name__}: {e}).")
 
-
+# ===============================================================================
 
 class DataFeed:
     """ 
     Market data inferface for bot:
-    1. Talk to 
+    1. Talk to an exhcnage via CCXT (fetch OHLCV + latest price)
+    2. Use CandleStore to persist datasets locally / on S3
     """
-    def __init__(self):
+    def __init__(self): # constructor
         load_dotenv()  # Load environment variables from .env file
-        config = ConfigManager() 
-        config.load_google_sheet()  # Load configuration from Google Sheets or local cache
+        # load config from Google Sheet
+        cfg = ConfigManager()
+        cfg.load_google_sheet()  # Load configuration from Google Sheets or local cache
 
-        # set the exchange and trading pair dynamically 
-        self.exchange_name = config.get("EXCHANGE_NAME") 
-        self.symbol = config.get("TRADING_PAIR")
-        self.timeframe = str(config.get("TIMEFRAME", "1d")).strip().lower() # default to 1h if not set
-        self.years_back = int(config.get("YEARS_BACK", 4))  # default to 1 year if not set
+        self.exchange_name = cfg.get('EXCHANGE_NAME')
+        self.symbol = cfg.get("TRADING_PAIR")
+        # Symbol guard, CCXT expects "BTC/USDT" (with slash), if sheet provides no slash, fixes
+        if isinstance(self.symbol, str) and '/' not in self.symbol and self.symbol.endswith('USDT'):
+            self.symbol = self.symbol.replace('USDT', '/USDT')
+        
+        # Timeframes configuation (recommend: 1h and 1d) 
+        timeframes_raw = cfg.get("TIMEFRAMES")
+        if timeframes_raw:
+            self.timeframes = [t.strip().lower() for t in str(timeframes_raw).split(',') if t.strip()]
+        else: 
+            self.timesframes = [str(cfg.get('TIMEFRAME', '1d')).strip().lower()]
+        
+        # How much history to download, 4 years is default
+        self.years_back = int(cfg.get('YEARS_BACK', 4))
 
-        # authentication keys from .env
-        self.api_key = os.getenv("API_KEY")
-        self.api_secret = os.getenv("API_SECRET")
+        # Storage wiring
+        data_dir = Path(str(cfg.get("DATA_DIR", 'Data')))
+        # takes whatever is in the config and converts to bool
+        use_s3 = str(cfg.get('USE_S3', '0')).strip().lower() in ('1', 'true', 'yes', 'y')
+        # bucket and prefix for s3 object keys
+        s3_bucket = cfg.get('S3_BUCKET')
+        s3_prefix = str(cfg.get('S3_PREFIX')).strip()
+        # create persistence layer, delegate saving/loading to CandleStore
+        self.store = CandleStore(StorageConfig(data_dir=data_dir, use_s3=use_s3, s3_bucket=s3_bucket, s3_prefix=s3_prefix))
 
-        # initialize exchange class to use
-        self.exchange = getattr(ccxt, self.exchange_name)({
-            'apiKey': self.api_key,
-            'secret': self.api_secret,
-            'enableRateLimit': True
-        })
-        self.exchange.load_markets() # load exchange rulebook + list of tradable pairs
+        # Authentication keys from .env
+        self.api_key = os.getenv('API_KEY')
+        self.api_secret = os.getenv('API_SECRET')
 
+        # Exchange object from CCXT
+        try:
+            exchange_class = getattr(ccxt, self.exchange_name)
+        except AttributeError as e:
+            raise ValueError(
+                f"Unknown ccxt exchange '{self.exchange_name}'. Check EXCHANGE_NAME in config."
+            ) from e 
+        # Instantiate exchange with auth and rate limit enabled
+        self.exchange = exchange_class(
+            {
+                'apiKey': self.api_key,
+                'secret': self.api_secret, 
+                'enableRateLimit': True
+            }
+        )
+        # Download exchange markets/rules
+        self.exchange.load_markets()
+
+    # ----------
+    # Helper Methods
+    # ----------
+    def _base_filename(self, timeframe: str, years_back: Optional[int] = None) -> str:
+        """
+        Builds a consistent dataset ID used for file names to standardize namimg
+        """
+        yb = self.years_back if years_back is None else years_back
+        # Example: binanceus_BTCUSDT_1h_4Y_to_now
+        return f"{self.exchange_name}_{self.symbol.replace('/', '')}_{timeframe}_{yb}Y_to_now"
+    
+    def _standardize_ohlcv_df(self, rows: list[list[float]]) -> pd.DataFrame:
+        """ 
+        CCXT returns OHLCV as a list of raw rows. This function turns that into a clean, time-indexed
+        DataFrame that the rest of the bot can trust. 
+        """
+        # convert it into a DataFrame with known schema
+        df = pd.DataFrame(rows, columns=['Date', 'open', 'high', 'low', 'close', 'volume'])
+        # convert timestamp ms to timezone-aware datetime in UTC
+        df['Date'] = pd.to_datetime(df['Date'], unit='ms', utc=True)
+        # Coerce OHLCV columns to numeric (some exchanges return strings)
+        for c in ['open', 'high', 'low', 'close', 'volume']:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+
+        # Remove bad/duplicatw rows and set Date as the index
+        df = (
+            df.dropna()  # drop rows with NaNs
+                .drop_duplicates(subset=['Date'])  # drop duplicate timestamps
+                .sort_values('Date')  # sort by Date
+                .set_index('Date')  # set Date as index
+        )
+        # Select and return only OHLCV columns
+        df = df[['open', 'high', 'low', 'close', 'volume']].copy()
+
+        # Basic schema sanity filters (defensive programming for messy exchange data)
+        df = df[df["volume"] >= 0]
+        df = df[
+            (df["high"] >= df["low"]) &
+            (df["high"] >= df["open"]) & (df["high"] >= df["close"]) &
+            (df["low"] <= df["open"]) & (df["low"] <= df["close"])
+        ]
+
+        return df
+
+    def ensure_history(
+            self, 
+            timeframe: str,
+            mode: str = 'live',
+            ensure_fresh: bool = True, # whether to refresh tail candles
+            persist: bool = True, # whether to save to storage after building/updating
+    ) -> pd.DataFrame:
+        """ 
+        Ensures history for this timeframe exists and is up to date. Makes pipeline reliable, by giving
+        one canonical way to get the right dataset.
+        - tries to load stored history
+        - if missing: feteches full history (build)
+        - if live and ensure_fresh: incrementally updates tail candles
+
+        Returns up-to-date DataFrame.
+        """
+        # normalize input
+        timeframe = timeframe.strip().lower()
+        mode = mode.strip().lower()
+
+        # First try loading from storage (local or S3)
+        try:
+            df = self.load_historical(timeframe)
+        # if missing, build it from scratch by fetching from exchange. Don't have to worry about missing files
+        except FileNotFoundError:
+            df = self.fetch_historical_ohlcv(timeframe=timeframe, persist=persist)
+        
+        # In live mode, refresh the tail candles
+        if mode == 'live' and ensure_fresh:
+            df = self.update_historical(timeframe=timeframe, df=df, persist=persist)
+        return df
+    
     def fetch_historical_ohlcv(
-                self, 
-                timeframe: str | None = None, 
-                years_back: int | None = None, 
-                out_dir: str | Path = "Data", 
-                base_filename: str | None = None, 
-                limit: int = 1000,
-        ) -> pd.DataFrame:
-        if timeframe is None:
-            timeframe = self.timeframe
-        if years_back is None:
-            years_back = self.years_back
-        # Define the date range for how far back to fetch data
+            self,
+            timeframe: Optional[str] = None,
+            years_back: Optional[int] = None,
+            limit: int = 1000,
+            persist: bool = True,
+    ) -> pd.DataFrame:
+        """
+        Run when want durable history file on disk so that:
+        - backtests can load instantly without hammering the exchange.
+        - live trading can incrementally update instead of re-downloading years of data.
+        Fetches full historical OHLCV data from exchange via CCXT. 
+        """
+        # use default timeframe if none provided
+        timeframe = (timeframe or self.timeframes[0]).strip().lower()
+        # uses default years_back if none provided
+        years_back = self.years_back if years_back is None else years_back
+
+        # Pick a start date: Jan 1st of (current year - years_back)
         now = datetime.now(timezone.utc)
         start_dt = datetime(now.year - years_back, 1, 1, tzinfo=timezone.utc)
+        # convert to milliseconds timestamp for CCXT
         since_ms = int(start_dt.timestamp() * 1000)
-        # Get current timestamp and candlesize in milliseconds
-        now_ms = self.exchange.milliseconds()
-        cl_ms = int(self.exchange.parse_timeframe(timeframe) * 1000) # candle lenghth in ms
-        out_dir = Path(out_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        if base_filename is None: # create base filename if not provided
-            base_filename = f"{self.exchange_name}_{self.symbol.replace('/', '')}_{timeframe}_{years_back}Y_to_now"
-        all_rows = []
+
+        now_ms = self.exchange.milliseconds() # exchange's current time in ms
+        cl_ms = int(self.exchange.parse_timeframe(timeframe) * 1000)  # candle length in ms
+        all_rows = []  # accumulates all candles across pages
         last_ts = None  # tracks last timestamp to detect no-progress
-        while since_ms < now_ms: # Pagination loop, fetching batches until we reach "now"
+
+        # Pagination loop, fetch chunks untill you reach 'now'
+        while since_ms < now_ms:
+            # fetch up to limit candles starting from since_ms
             batch = self.exchange.fetch_ohlcv(self.symbol, timeframe=timeframe, since=since_ms, limit=limit)
-            if not batch: 
+            if not batch:
                 break  # exit if no data returned
-            # open timestamp of last candle in this batch
+
+            # safety valve: if no progress in timestamps, exit to avoid infinite loop
             batch_last_ts = batch[-1][0]
-            # Guard aganist infinite loops if exchange returns 
             if last_ts is not None and batch_last_ts <= last_ts:
                 print("No new data returned, ending fetch.")
                 break
-            # accumulate results
+            
+            # Accumulate
             all_rows.extend(batch)
             last_ts = batch_last_ts
-             # move "since" to just after the last candle to avoid duplicates
-            # Next request, start at the next candle after the last one I already have.
-            since_ms = batch_last_ts + cl_ms
-            # respect API rate limits
+            # adding +1 ms avoids timestamp alignment issues that can cause gaps if jumped by exact candle length
+            since_ms = batch_last_ts + 1 
+
+            # Respect exchange throttling
             time.sleep(self.exchange.rateLimit / 1000)
         if not all_rows:
-            raise RuntimeError(f"No OHLCV data returned for {self.symbol} {timeframe}.")
-        
-        df = pd.DataFrame(all_rows, columns=["Date", "open", "high", "low", "close", "volume"])
-        # Clean timestamp and clean types
-        df['Date'] = pd.to_datetime(df['Date'], unit='ms', utc=True)
-        for c in ["open", "high", "low", "close", "volume"]:
-            df[c] = pd.to_numeric(df[c], errors='coerce')
-        # Clean duplicates + sort + index (pagination can overlap depending on exchange quirks)
-        df = (
-            df.dropna()
-              .drop_duplicates(subset=["Date"])
-              .sort_values("Date")
-              .set_index("Date")
-        )
-        # Keep only what you need + add log returns
-        df = df[["open", "high", "low", "close", "volume"]].copy()
-        # Add log return column, log(close_t) - log(close_{t-1})
-        df["log_ret"] = np.log(df["close"]).diff()
-        # Save to Parquet + CSV
-        parquet_path = out_dir / f"{base_filename}.parquet"
-        csv_path = out_dir / f"{base_filename}.csv"
-        try:
-            df.to_parquet(parquet_path, index=True)
-        except Exception as e:
-            print(f"[WARN] Parquet save failed ({type(e).__name__}: {e}).")
-        df.to_csv(csv_path, index=True)
-        return df
-    def get_latest_price(self) -> float:
-            ticker = self.exchange.fetch_ticker(self.symbol)
-            return ticker['last']
+            raise RuntimeError(f'NO OHLCV data returned for {self.symbol} {timeframe}.')
+        # convert raw rows to clean DataFrame
+        df = self._standardize_ohlcv_df(all_rows)
 
+        # save to storage if requested
+        if persist:
+            base = self._base_filename(timeframe, years_back)
+            self.store.save(df, base)
+
+        return df
+
+    def load_historical(self, timeframe: str, years_back: Optional[int] = None) -> pd.DataFrame:
+        """
+        Load stored historical OHLCV data from local/S3.
+        Build the file ID and asks CandleStore to load it.
+        """
+        timerame = timeframe.strip().lower()
+        base = self._base_filename(timerame, years_back)
+        return self.store.load(base)
+    
+    def save_historical(self, df: pd.DataFrame, timeframe: str, years_back: Optional[int] = None) -> None:
+        """
+        Wrapper around store.save(). Keeps namimg consistent.
+        """
+        timeframe = timeframe.strip().lower()
+        base = self._base_filename(timeframe, years_back)
+        self.store.save(df, base)
+
+    def update_historical(
+            self,
+            timeframe: str, 
+            df: Optional[pd.DataFrame] = None,
+            lookback_candles: int = 3, # refetch last 3 candles and overwrite them to keep tail accurate
+            limit: int = 1000,
+            persist: bool = True,
+    ) -> pd.DataFrame:
+        """  
+        'live maintenance' function for stored candle dataset to keep the big historical file fresh
+        by keeping that file fresh by refetching only the most recetn candles and merging them in safety.
+
+        Prevents bot from trading on stale or partially formed candles without constantly re-downloading years of data.
+        """
+        timeframe = timeframe.strip().lower()
+        cl_ms = int(self.exchange.parse_timeframe(timeframe) * 1000)  # candle length in ms
+
+        # if caller didnt provide df, load from storage
+        if df is None:
+            df = self.load_historical(timeframe)
+        
+        # if dataset exists but is empty, rebuild
+        if df.empty:
+            df = self.fetch_historical_ohlcv(timeframe=timeframe, persist=persist)
+
+        # Find the last candle timestamp and compute overlap window
+        last_dt = pd.to_datetime(df.index.max(), utc=True)
+        last_ms = int(last_dt.timestamp() * 1000) 
+
+        # Pull back a few candles to safely replace the tail
+        since_ms = max(0, last_ms - cl_ms * max(lookback_candles - 1,0))
+
+        # Fetch the recent candles from the exchange
+        rows = self.exchange.fetch_ohlcv(self.symbol, timeframe=timeframe, since=since_ms, limit=limit)
+        if not rows:
+            return df
+        
+        # standardize fetched rows into DataFrame
+        new_df = self._standardize_ohlcv_df(rows)
+
+        # Merge old + new and overwrite overlapping timestamps
+        combined = pd.concat([df, new_df])
+        combined = combined[~combined.index.duplicated(keep='last')].sort_index()
+        # persis updated dataset
+        if persist: 
+            self.save_historical(combined, timeframe)
+
+        return combined
+
+    def get_ohlcv(
+            self, 
+            timeframe: str,
+            lookback: int, 
+            mode: str = 'live', 
+            ensure_fresh: bool = True,
+    ) -> pd.DataFrame:
+        """
+        High-level method to get OHLCV data for a given timeframe and lookback.
+        Unified accessor.
+
+        Always routes through ensure_history() so callers never crash if the dataset
+        hasn't been built yet.
+
+        - backtest: loads stored dataset and tail(lookback)
+        - live: ensures dataset exists, optionally updates tail candles, then tail(lookback)
+        """
+        timeframe = timeframe.strip().lower()
+        mode = mode.strip().lower()
+
+        # Returns only what is needed: last 'lookback' candles
+        df = self.ensure_history(timeframe, mode=mode, ensure_fresh=ensure_fresh, persist=True)
+        return df.tail(int(lookback)).copy()
+    
+    def get_latest_price(self) -> float:
+        """Fetches the latest price for the trading pair from the exchange."""
+        ticker = self.exchange.fetch_ticker(self.symbol)
+        return float(ticker['last'])
 
 if __name__ == "__main__":
     feed = DataFeed()
-    df = feed.fetch_historical_ohlcv()
-    df = feed.fetch_historical_ohlcv(out_dir="Data")
-    print(f"Fetched {feed.timeframe} candles:", df.shape)
+
+    # One clean path for both backtest/live: ensure datasets exist and (optionally) refresh.
+    for tf in feed.timeframes:
+        df_tf = feed.ensure_history(tf, mode="live", ensure_fresh=True, persist=True)
+        print(f"[INFO] {tf} rows:", df_tf.shape[0], "last:", df_tf.index.max())
+
+    # Pull last N candles from the first configured timeframe
+    tf0 = feed.timeframes[0]
+    last_200 = feed.get_ohlcv(tf0, lookback=200, mode="live", ensure_fresh=True)
+    print(f"{tf0} candles (tail=200):", last_200.shape)
+
     print("Latest price:", feed.get_latest_price())
